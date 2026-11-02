@@ -1,0 +1,250 @@
+from dataclasses import dataclass
+
+import numpy as np
+
+# matplotlib es opcional: si no está instalado, solo se omite la gráfica
+try:
+    import matplotlib.pyplot as plt
+    HAY_MATPLOTLIB = True
+except ImportError:  # pragma: no cover
+    HAY_MATPLOTLIB = False
+
+
+# ---------------------------------------------------------------------------
+# 1. PARÁMETROS DE ENTRADA
+# ---------------------------------------------------------------------------
+@dataclass
+class Parametros:
+    """Todos los supuestos del plan en un solo lugar (fácil de modificar)."""
+
+    # --- Perfil de la persona ---
+    edad_actual: int = 30            # Edad hoy
+    edad_retiro: int = 65            # Edad a la que deja de aportar
+    edad_final: int = 90             # Edad hasta la que debe durar el dinero
+
+    # --- Dinero ---
+    saldo_inicial: float = 100_000       # Ahorro actual
+    aportacion_anual: float = 60_000     # Aportación del primer año
+    retiro_anual_hoy: float = 300_000    # Retiro deseado, en pesos DE HOY
+
+    # --- Supuestos de mercado (anuales) ---
+    rendimiento_medio: float = 0.08      # Rendimiento esperado nominal (8 %)
+    volatilidad: float = 0.15            # Desv. estándar del rendimiento (15 %)
+    inflacion: float = 0.04              # Inflación promedio (4 %)
+
+    # --- Parámetros de la simulación ---
+    n_simulaciones: int = 10_000         # Mientras más, más precisión
+    semilla: int = 42                    # Semilla -> resultados reproducibles
+
+
+# ---------------------------------------------------------------------------
+# 2. GENERACIÓN DE RENDIMIENTOS ALEATORIOS
+# ---------------------------------------------------------------------------
+def generar_rendimientos(p: Parametros, n_anios: int, rng: np.random.Generator) -> np.ndarray:
+    """
+    Genera una matriz de rendimientos anuales de tamaño (n_simulaciones, n_anios).
+    Cada fila es un "futuro posible" y cada columna un año.
+
+    Se usa una lognormal calibrada para que:
+        - la MEDIA aritmética de los rendimientos sea `rendimiento_medio`
+        - la DESVIACIÓN ESTÁNDAR sea aproximadamente `volatilidad`
+    """
+    m = 1.0 + p.rendimiento_medio    # Media del factor de crecimiento (1 + r)
+    s = p.volatilidad                # Desviación estándar del factor
+
+    # Conversión de (media, desv. est.) de una lognormal a los parámetros
+    # (mu, sigma) de la normal subyacente:
+    #   sigma^2 = ln(1 + s^2 / m^2)
+    #   mu      = ln(m) - sigma^2 / 2
+    sigma_log = np.sqrt(np.log(1.0 + (s / m) ** 2))
+    mu_log = np.log(m) - 0.5 * sigma_log ** 2
+
+    # Muestreo aleatorio: aquí es donde ocurre el "Montecarlo".
+    # Se obtiene exp(Normal) = factor de crecimiento; restamos 1 para el rendimiento.
+    factores = rng.lognormal(mean=mu_log, sigma=sigma_log,
+                             size=(p.n_simulaciones, n_anios))
+    return factores - 1.0
+
+
+# ---------------------------------------------------------------------------
+# 3. SIMULACIÓN DE LAS TRAYECTORIAS
+# ---------------------------------------------------------------------------
+def simular(p: Parametros):
+    """
+    Ejecuta la simulación completa y devuelve un diccionario con:
+        - trayectorias:   saldos nominales año por año  (N x (n_anios+1))
+        - saldo_retiro:   saldo nominal al llegar a la edad de retiro (N,)
+        - saldo_final:    saldo nominal a la edad final (N,)
+        - agotado:        True si el dinero se acabó antes de la edad final (N,)
+        - edad_agotado:   edad en la que se agotó (NaN si no se agotó) (N,)
+        - factor_inflacion: inflación acumulada por año (para pasar a pesos de hoy)
+    """
+    rng = np.random.default_rng(p.semilla)   # Generador de números aleatorios
+
+    anios_acum = p.edad_retiro - p.edad_actual   # Años de ahorro
+    anios_ret = p.edad_final - p.edad_retiro     # Años de retiro
+    n_anios = anios_acum + anios_ret             # Horizonte total
+
+    # Matriz de rendimientos: una fila por simulación, una columna por año
+    rendimientos = generar_rendimientos(p, n_anios, rng)
+
+    # Matriz de saldos; la columna 0 es el saldo inicial (hoy)
+    saldos = np.zeros((p.n_simulaciones, n_anios + 1))
+    saldos[:, 0] = p.saldo_inicial
+
+    # Factor de inflación acumulada: año 0 = 1.0, año 1 = 1.04, año 2 = 1.04^2...
+    factor_inflacion = (1.0 + p.inflacion) ** np.arange(n_anios + 1)
+
+    # Retiro anual expresado en pesos del año en que inicia el retiro
+    # (el deseo "de hoy" se infla hasta el año de retiro)
+    retiro_inicial = p.retiro_anual_hoy * factor_inflacion[anios_acum]
+
+    # Bandera: qué simulaciones ya "quebraron" (saldo llegó a 0)
+    agotado = np.zeros(p.n_simulaciones, dtype=bool)
+    edad_agotado = np.full(p.n_simulaciones, np.nan)
+
+    # --- Bucle año por año (vectorizado sobre todas las simulaciones) ---
+    for t in range(n_anios):
+        saldo = saldos[:, t]
+        r = rendimientos[:, t]
+
+        if t < anios_acum:
+            # FASE 1: ACUMULACIÓN
+            # La aportación crece con la inflación para mantener poder adquisitivo
+            aportacion = p.aportacion_anual * factor_inflacion[t]
+            nuevo = (saldo + aportacion) * (1.0 + r)
+        else:
+            # FASE 2: RETIRO
+            # El retiro crece con la inflación desde el momento del retiro
+            retiro = retiro_inicial * (1.0 + p.inflacion) ** (t - anios_acum)
+            nuevo = (saldo - retiro) * (1.0 + r)
+
+            # Detectar quiebra: el saldo cae a 0 o menos y antes no estaba agotado
+            nuevo_quiebra = (nuevo <= 0) & (~agotado)
+            edad_agotado[nuevo_quiebra] = p.edad_actual + t + 1
+            agotado |= nuevo <= 0
+
+        # Un saldo no puede ser negativo: si se agotó, se queda en 0
+        saldos[:, t + 1] = np.maximum(nuevo, 0.0)
+
+    return {
+        "trayectorias": saldos,
+        "saldo_retiro": saldos[:, anios_acum],
+        "saldo_final": saldos[:, -1],
+        "agotado": agotado,
+        "edad_agotado": edad_agotado,
+        "factor_inflacion": factor_inflacion,
+        "anios_acum": anios_acum,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 4. ANÁLISIS Y REPORTE DE RESULTADOS
+# ---------------------------------------------------------------------------
+def dinero(x: float) -> str:
+    """Formato monetario legible: $1,234,567."""
+    return f"${x:,.0f}"
+
+
+def reporte(p: Parametros, res: dict) -> None:
+    """Imprime estadísticas clave a partir de las simulaciones."""
+    fi = res["factor_inflacion"]
+    ac = res["anios_acum"]
+
+    # Pasamos a "pesos de hoy" (poder adquisitivo real) dividiendo entre la inflación
+    retiro_real = res["saldo_retiro"] / fi[ac]
+    final_real = res["saldo_final"] / fi[-1]
+
+    # Probabilidad de éxito = proporción de simulaciones donde NO se agotó el dinero
+    # (Ley de los grandes números: la frecuencia aproxima la probabilidad)
+    prob_exito = 1.0 - res["agotado"].mean()
+
+    # Percentiles: 10 % = escenario pesimista, 50 % = mediana, 90 % = optimista
+    pcts = [10, 25, 50, 75, 90]
+
+    print("=" * 66)
+    print(" SIMULACIÓN DE MONTECARLO - PLAN DE RETIRO")
+    print("=" * 66)
+    print(f" Simulaciones: {p.n_simulaciones:,}   |   Semilla: {p.semilla}")
+    print(f" Edad actual {p.edad_actual} -> retiro {p.edad_retiro} -> final {p.edad_final}")
+    print(f" Rend. medio {p.rendimiento_medio:.1%} | Volatilidad {p.volatilidad:.1%} "
+          f"| Inflación {p.inflacion:.1%}")
+    print("-" * 66)
+
+    print(f"\n SALDO AL RETIRO (edad {p.edad_retiro}), en pesos de hoy:")
+    for q in pcts:
+        print(f"   Percentil {q:>2}: {dinero(np.percentile(retiro_real, q)):>16}")
+    print(f"   Promedio    : {dinero(retiro_real.mean()):>16}")
+
+    print(f"\n SALDO A LOS {p.edad_final} AÑOS, en pesos de hoy:")
+    for q in pcts:
+        print(f"   Percentil {q:>2}: {dinero(np.percentile(final_real, q)):>16}")
+
+    print("\n" + "-" * 66)
+    print(f" PROBABILIDAD DE QUE EL DINERO ALCANCE HASTA LOS {p.edad_final}: "
+          f"{prob_exito:.1%}")
+
+    # Si hubo simulaciones que se quedaron sin dinero, ¿a qué edad típicamente?
+    edades = res["edad_agotado"][res["agotado"]]
+    if edades.size > 0:
+        print(f" En los casos de agotamiento, la edad mediana fue: "
+              f"{np.median(edades):.0f} años")
+    print("=" * 66)
+    print(" Nota: modelo educativo con supuestos simplificados; no es asesoría")
+    print(" financiera. Cambie los parámetros en la clase `Parametros`.")
+
+
+def graficar(p: Parametros, res: dict) -> None:
+    """Genera dos gráficas: abanico de trayectorias e histograma del saldo al retiro."""
+    if not HAY_MATPLOTLIB:
+        print("\n(matplotlib no instalado: se omite la gráfica)")
+        return
+
+    fi = res["factor_inflacion"]
+    # Trayectorias en pesos de hoy (dividimos cada columna/año por su inflación)
+    real = res["trayectorias"] / fi
+    edades = np.arange(p.edad_actual, p.edad_final + 1)
+
+    fig, ejes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # --- Gráfica 1: abanico de percentiles ---
+    ax = ejes[0]
+    # Algunas trayectorias individuales (muestra de 50) para ver la dispersión
+    ax.plot(edades, real[:50].T, color="gray", alpha=0.15, lw=0.8)
+    p10, p50, p90 = np.percentile(real, [10, 50, 90], axis=0)
+    ax.fill_between(edades, p10, p90, alpha=0.25, label="Rango 10%-90%")
+    ax.plot(edades, p50, lw=2.5, label="Mediana")
+    ax.axvline(p.edad_retiro, color="red", ls="--", label="Retiro")
+    ax.set_title("Evolución del patrimonio (pesos de hoy)")
+    ax.set_xlabel("Edad")
+    ax.set_ylabel("Saldo")
+    ax.yaxis.set_major_formatter(lambda x, _: f"${x/1e6:.1f}M")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    # --- Gráfica 2: histograma del saldo al retiro ---
+    ax = ejes[1]
+    retiro_real = res["saldo_retiro"] / fi[res["anios_acum"]]
+    ax.hist(retiro_real, bins=60, alpha=0.8)
+    ax.axvline(np.median(retiro_real), color="red", ls="--", label="Mediana")
+    ax.set_title(f"Distribución del saldo a los {p.edad_retiro} años")
+    ax.set_xlabel("Saldo (pesos de hoy)")
+    ax.set_ylabel("Frecuencia")
+    ax.xaxis.set_major_formatter(lambda x, _: f"${x/1e6:.1f}M")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig("montecarlo_retiro.png", dpi=130)
+    print("\n Gráfica guardada en: montecarlo_retiro.png")
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
+# 5. PUNTO DE ENTRADA
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    parametros = Parametros()          # <- Modifique aquí sus supuestos
+    resultados = simular(parametros)   # Ejecuta el Montecarlo
+    reporte(parametros, resultados)    # Imprime estadísticas
+    graficar(parametros, resultados)   # Dibuja gráficas
